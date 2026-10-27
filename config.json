@@ -1,0 +1,18 @@
+{
+    "local_clips_dir": "D:\\Clips\\STEELSERIES MOMENTS",
+    "drive_folder_name": "SteelSeries_Clips",
+    "storage_limit_gb": 14.0,
+    "allowed_extensions": [
+        ".mp4",
+        ".mkv",
+        ".mov",
+        ".avi"
+    ],
+    "ignore_subfolders": [
+        "Exported Clips",
+        "Shared Clips"
+    ],
+    "check_interval_seconds": 300,
+    "auto_sync": true,
+    "delete_local_after_upload": false
+}
