@@ -2,7 +2,7 @@
     "local_clips_dir": "D:\\Clips\\STEELSERIES MOMENTS",
     "drive_folder_name": "SteelSeries_Clips",
     "storage_limit_gb": 13.0,
-    "retention_days": 14,
+    "retention_days": 60,
     "allowed_extensions": [
         ".mp4",
         ".mkv",

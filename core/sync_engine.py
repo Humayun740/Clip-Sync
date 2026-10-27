@@ -1,6 +1,7 @@
 import os
 import json
 import time
+import msvcrt
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Callable
 from datetime import datetime
@@ -13,8 +14,44 @@ from core.gdrive import GoogleDriveManager, DriveFile
 BASE_DIR = Path(__file__).resolve().parent.parent
 STATUS_FILE = BASE_DIR / "status.json"
 LOG_FILE = BASE_DIR / "sync.log"
+LOCK_FILE = BASE_DIR / "sync.lock"
 
 SAFETY_BUFFER_BYTES = 500 * 1024 * 1024  # 500 MB safe margin below total Google Account limit
+
+class CrossProcessLock:
+    """Windows-native cross-process file lock using msvcrt."""
+    def __init__(self, lock_path: Path):
+        self.lock_path = lock_path
+        self.handle = None
+
+    def acquire(self) -> bool:
+        try:
+            self.handle = open(self.lock_path, "a+")
+            self.handle.seek(0)
+            msvcrt.locking(self.handle.fileno(), msvcrt.LK_NBLCK, 1)
+            self.handle.truncate(0)
+            self.handle.write(f"pid={os.getpid()}\ntime={time.time()}\n")
+            self.handle.flush()
+            return True
+        except (IOError, OSError):
+            if self.handle:
+                try:
+                    self.handle.close()
+                except Exception:
+                    pass
+                self.handle = None
+            return False
+
+    def release(self):
+        if self.handle:
+            try:
+                self.handle.seek(0)
+                msvcrt.locking(self.handle.fileno(), msvcrt.LK_UNLCK, 1)
+                self.handle.close()
+            except Exception:
+                pass
+            self.handle = None
+
 
 class SyncEngine:
     def __init__(
@@ -75,17 +112,23 @@ class SyncEngine:
 
     def run_sync_cycle(self) -> Dict[str, Any]:
         """
-        Executes a deterministic, idempotent Top-K sync pass:
-        1. Empties Google Drive Trash if needed.
-        2. Filters local clips by retention_days (e.g. last 14 days).
-        3. Selects the NEWEST clips that fit within the storage limit (Desired Cloud Set).
-        4. Prunes any cloud files that are NOT in the Desired Cloud Set.
-        5. Uploads any missing clips from the Desired Cloud Set (newest first).
-        Guaranteed: No infinite loops, no thrashing, and automatic replacement of oldest clips.
+        Executes a deterministic, idempotent Top-K sync pass with cross-process concurrency locking:
+        1. Acquires system-wide lock to prevent duplicate runs.
+        2. Cleans Google Drive Trash.
+        3. Scans local clips within retention window (e.g. last 60 days).
+        4. Selects newest clips fitting within storage cap (Desired Cloud Set).
+        5. Automatically cleans duplicates and prunes outdated cloud clips.
+        6. Uploads remaining pending clips (newest first).
+        7. Enters stable idle state.
         """
         if self.is_running:
-            self.log("Sync already in progress. Skipping cycle.")
+            self.log("Sync already in progress in this instance. Skipping.")
             return {"status": "skipped", "reason": "in_progress"}
+
+        lock = CrossProcessLock(LOCK_FILE)
+        if not lock.acquire():
+            self.log("Another sync cycle is actively running in the background. Skipping duplicate run.")
+            return {"status": "skipped", "reason": "locked"}
 
         self.is_running = True
         stats = {
@@ -106,7 +149,7 @@ class SyncEngine:
                 self.log("Google Drive is not authenticated. Attempting authentication...")
                 self.drive.authenticate(callback_prompt=self.log)
 
-            # 1. Clean Trash
+            # 1. Clean Trash if any
             detailed_quota = self.drive.get_detailed_quota()
             trash_bytes = detailed_quota.get("usageInDriveTrash", 0)
             if trash_bytes > 0:
@@ -120,7 +163,7 @@ class SyncEngine:
             retention_days = self.config.retention_days
             limit_gb = self.config.storage_limit_gb
 
-            # Determine effective storage cap
+            # Storage cap
             effective_cap_bytes = self.config.storage_limit_bytes
             if account_limit > 0:
                 safe_account_cap = max(0, account_limit - SAFETY_BUFFER_BYTES)
@@ -154,7 +197,7 @@ class SyncEngine:
             # 4. Sort Eligible Clips NEWEST FIRST
             eligible_clips.sort(key=lambda c: c.timestamp, reverse=True)
 
-            # 5. Build Desired Cloud Set (Newest first, fitting under effective_cap_bytes)
+            # 5. Build Desired Cloud Set (Newest first, fitting under storage cap)
             desired_clips: List[ClipInfo] = []
             accumulated_bytes = 0
             for clip in eligible_clips:
@@ -162,7 +205,6 @@ class SyncEngine:
                     desired_clips.append(clip)
                     accumulated_bytes += clip.size
                 else:
-                    # Clip would push past storage limit
                     break
 
             desired_names = {c.name: c for c in desired_clips}
@@ -171,13 +213,27 @@ class SyncEngine:
                 f"({accumulated_bytes / (1024**3):.2f} / {limit_gb:.1f} GB)."
             )
 
-            # 6. Fetch Existing Files from Google Drive
+            # 6. Fetch Existing Files from Google Drive & Deduplicate
             self._write_status("scanning", last_message="Inspecting Google Drive folder...")
-            cloud_files = self.drive.list_files_in_folder(folder_name)
-            cloud_file_map = {f.name: f for f in cloud_files}
+            raw_cloud_files = self.drive.list_files_in_folder(folder_name)
+
+            # Deduplicate cloud files if duplicate uploads occurred
+            cloud_file_map: Dict[str, DriveFile] = {}
+            duplicates_to_delete: List[DriveFile] = []
+            for f in raw_cloud_files:
+                if f.name in cloud_file_map:
+                    duplicates_to_delete.append(f)
+                else:
+                    cloud_file_map[f.name] = f
+
+            if duplicates_to_delete:
+                self.log(f"[Deduplication] Removing {len(duplicates_to_delete)} duplicate file(s) in cloud...")
+                for df in duplicates_to_delete:
+                    self.drive.delete_file(df.file_id)
+                self.drive.empty_trash()
 
             # 7. PRUNE: Remove any cloud file NOT in desired_clips
-            files_to_delete = [f for f in cloud_files if f.name not in desired_names]
+            files_to_delete = [f for f in cloud_file_map.values() if f.name not in desired_names]
 
             if files_to_delete:
                 self.log(f"Found {len(files_to_delete)} cloud file(s) outside target retention or pushed out by newer clips. Pruning...")
@@ -191,7 +247,6 @@ class SyncEngine:
                     else:
                         self.log(f"[Warning] Failed to delete cloud file '{f.name}'.")
 
-                # Empty trash after pruning
                 self.drive.empty_trash()
 
             # 8. UPLOAD: Upload any clip in desired_clips that is NOT yet on Drive (Newest First)
@@ -257,5 +312,6 @@ class SyncEngine:
             self._write_status("error", last_message=err)
         finally:
             self.is_running = False
+            lock.release()
 
         return stats

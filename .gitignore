@@ -27,3 +27,7 @@ venv/
 status.json
 status.tmp
 sync.log
+
+# Lock files
+sync.lock
+*.lock
