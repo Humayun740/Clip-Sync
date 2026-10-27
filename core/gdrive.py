@@ -89,13 +89,32 @@ class GoogleDriveManager:
 
     def get_account_storage_info(self) -> Dict[str, int]:
         """Returns Google Account storage info in bytes: {'limit': ..., 'usage': ...}"""
+        quota = self.get_detailed_quota()
+        return {"limit": quota.get("limit", 0), "usage": quota.get("usage", 0)}
+
+    def get_detailed_quota(self) -> Dict[str, int]:
+        """Returns detailed Google Drive quota including trash, usage, and limit in bytes."""
         if not self.service:
             self.authenticate()
         about = self.service.about().get(fields="storageQuota").execute()
         quota = about.get("storageQuota", {})
-        limit = int(quota.get("limit", 0))  # 0 or None if unlimited
-        usage = int(quota.get("usage", 0))
-        return {"limit": limit, "usage": usage}
+        return {
+            "limit": int(quota.get("limit", 0)),
+            "usage": int(quota.get("usage", 0)),
+            "usageInDrive": int(quota.get("usageInDrive", 0)),
+            "usageInDriveTrash": int(quota.get("usageInDriveTrash", 0))
+        }
+
+    def empty_trash(self) -> bool:
+        """Permanently empties Google Drive trash to reclaim quota immediately."""
+        if not self.service:
+            self.authenticate()
+        try:
+            self.service.files().emptyTrash().execute()
+            return True
+        except Exception as e:
+            print(f"[Drive] Could not empty trash: {e}")
+            return False
 
     def get_or_create_folder(self, folder_name: str) -> str:
         """Finds or creates the target folder in Google Drive and caches folder_id."""
