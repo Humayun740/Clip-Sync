@@ -22,3 +22,8 @@ venv/
 
 # Logs
 *.log
+
+# Runtime status files
+status.json
+status.tmp
+sync.log

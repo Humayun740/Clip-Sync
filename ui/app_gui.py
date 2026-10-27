@@ -1,5 +1,8 @@
 import sys
 import os
+import json
+import time
+import ctypes
 import threading
 from pathlib import Path
 from PyQt5.QtWidgets import (
@@ -8,13 +11,29 @@ from PyQt5.QtWidgets import (
     QProgressBar, QTextEdit, QFileDialog, QGroupBox, QMessageBox,
     QSystemTrayIcon, QMenu, QAction, QStyle
 )
-from PyQt5.QtCore import Qt, pyqtSignal, QObject
+from PyQt5.QtCore import Qt, pyqtSignal, QObject, QTimer
 from PyQt5.QtGui import QIcon, QFont, QTextCursor
 
 from core.config import AppConfig
 from core.gdrive import GoogleDriveManager
-from core.sync_engine import SyncEngine
+from core.sync_engine import SyncEngine, STATUS_FILE, LOG_FILE
 from core.watcher import SyncWatcher
+
+def is_pid_running(pid: int) -> bool:
+    """Checks whether a given Windows PID is currently running."""
+    if pid <= 0:
+        return False
+    try:
+        kernel32 = ctypes.windll.kernel32
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid)
+        if handle:
+            kernel32.CloseHandle(handle)
+            return True
+        return False
+    except Exception:
+        return False
+
 
 class GuiLogSignals(QObject):
     log_signal = pyqtSignal(str)
@@ -30,6 +49,7 @@ class PassthruMainWindow(QMainWindow):
         self.config = AppConfig.load()
         self.credentials_file = config_dir / "credentials.json"
         self.token_file = config_dir / "token.json"
+        self.last_log_seek_pos = 0
 
         self.signals = GuiLogSignals()
         self.signals.log_signal.connect(self.append_log)
@@ -49,6 +69,14 @@ class PassthruMainWindow(QMainWindow):
         self.init_ui()
         self.init_tray()
         self.check_auth_status()
+
+        # Load existing sync.log history
+        self.load_initial_log_history()
+
+        # Timer to poll background status & tail sync.log
+        self.status_timer = QTimer(self)
+        self.status_timer.timeout.connect(self.poll_background_status)
+        self.status_timer.start(1000)
 
     def init_ui(self):
         self.setWindowTitle("Passthru - Game Clip Auto-Sync & Rolling Cloud")
@@ -173,7 +201,7 @@ class PassthruMainWindow(QMainWindow):
         main_layout.addLayout(actions_layout)
 
         # 5. Live Activity Log
-        log_label = QLabel("Activity Log:")
+        log_label = QLabel("Live Activity Log:")
         main_layout.addWidget(log_label)
 
         self.log_box = QTextEdit()
@@ -184,10 +212,11 @@ class PassthruMainWindow(QMainWindow):
     def init_tray(self):
         self.tray_icon = QSystemTrayIcon(self)
         self.tray_icon.setIcon(self.style().standardIcon(QStyle.SP_DriveHDIcon))
+        self.tray_icon.setToolTip("Passthru - Game Clip Sync")
 
         tray_menu = QMenu()
-        show_action = QAction("Open Passthru", self)
-        show_action.triggered.connect(self.showNormal)
+        show_action = QAction("Open Passthru Window", self)
+        show_action.triggered.connect(self.restore_window)
         tray_menu.addAction(show_action)
 
         sync_action = QAction("Sync Now", self)
@@ -195,12 +224,92 @@ class PassthruMainWindow(QMainWindow):
         tray_menu.addAction(sync_action)
 
         tray_menu.addSeparator()
-        exit_action = QAction("Exit", self)
+        exit_action = QAction("Exit Completely", self)
         exit_action.triggered.connect(self.quit_app)
         tray_menu.addAction(exit_action)
 
         self.tray_icon.setContextMenu(tray_menu)
+        self.tray_icon.activated.connect(self.on_tray_activated)
         self.tray_icon.show()
+
+    def on_tray_activated(self, reason):
+        if reason in (QSystemTrayIcon.DoubleClick, QSystemTrayIcon.Trigger):
+            self.restore_window()
+
+    def restore_window(self):
+        self.showNormal()
+        self.activateWindow()
+
+    def load_initial_log_history(self):
+        if LOG_FILE.exists():
+            try:
+                with open(LOG_FILE, "r", encoding="utf-8", errors="ignore") as f:
+                    lines = f.readlines()
+                    # Show last 100 lines
+                    recent = lines[-100:]
+                    self.log_box.setPlainText("".join(recent))
+                    self.log_box.moveCursor(QTextCursor.End)
+                    self.last_log_seek_pos = f.tell()
+            except Exception:
+                pass
+
+    def poll_background_status(self):
+        # 1. Tail sync.log for new lines
+        if LOG_FILE.exists():
+            try:
+                with open(LOG_FILE, "r", encoding="utf-8", errors="ignore") as f:
+                    f.seek(self.last_log_seek_pos)
+                    new_content = f.read()
+                    if new_content:
+                        self.log_box.append(new_content.strip())
+                        self.log_box.moveCursor(QTextCursor.End)
+                        self.last_log_seek_pos = f.tell()
+            except Exception:
+                pass
+
+        # 2. Check status.json
+        if not STATUS_FILE.exists():
+            return
+
+        try:
+            with open(STATUS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            pid = data.get("pid", 0)
+            status = data.get("status", "idle")
+            last_updated = data.get("last_updated", 0)
+            is_active = (time.time() - last_updated < 15) and is_pid_running(pid)
+
+            cloud_files_count = data.get("cloud_files_count", 0)
+            cloud_size_gb = data.get("cloud_size_gb", 0.0)
+            limit_gb = self.config.storage_limit_gb
+
+            # Update storage meters
+            if cloud_files_count > 0 or cloud_size_gb > 0:
+                self.lbl_cloud_file_count.setText(f"Cloud Files: {cloud_files_count}")
+                percent = int(min(100, (cloud_size_gb / limit_gb) * 100)) if limit_gb > 0 else 0
+                self.bar_storage.setValue(percent)
+                self.bar_storage.setFormat(f"Cloud Used: {cloud_size_gb:.2f} / {limit_gb:.1f} GB ({percent}%)")
+
+            # If background process is uploading
+            if is_active and pid != os.getpid() and status in ("uploading", "scanning", "evicting", "authenticating"):
+                current_file = data.get("current_file", "")
+                upload_percent = data.get("percent", 0)
+                msg = data.get("last_message", "")
+
+                self.btn_sync_now.setEnabled(False)
+                self.btn_sync_now.setText(f"Syncing in Background (PID {pid})...")
+                self.lbl_upload_status.setText(f"Status: {msg}")
+                self.bar_upload.setValue(upload_percent)
+            elif not self.engine.is_running:
+                self.btn_sync_now.setEnabled(True)
+                self.btn_sync_now.setText("⚡ Sync Now")
+                if status == "idle" and self.lbl_upload_status.text().startswith("Status: Background"):
+                    self.lbl_upload_status.setText("Status: Idle (All in sync)")
+                    self.bar_upload.setValue(0)
+
+        except Exception:
+            pass
 
     def check_auth_status(self):
         threading.Thread(target=self._check_auth_worker, daemon=True).start()
@@ -309,12 +418,24 @@ class PassthruMainWindow(QMainWindow):
     def quit_app(self):
         if self.watcher.is_running():
             self.watcher.stop()
+        if hasattr(self, 'status_timer'):
+            self.status_timer.stop()
         QApplication.quit()
 
     def closeEvent(self, event):
-        # Ask to minimize to tray or close
-        event.accept()
-        self.quit_app()
+        """Minimize to system tray on window close so it doesn't interrupt background sync."""
+        if self.tray_icon.isVisible():
+            event.ignore()
+            self.hide()
+            self.tray_icon.showMessage(
+                "Passthru Running in Background",
+                "Passthru has been minimized to your system tray. Double-click the tray icon anytime to view progress.",
+                QSystemTrayIcon.Information,
+                2000
+            )
+        else:
+            event.accept()
+            self.quit_app()
 
 
 def start_gui(config_dir: Path):

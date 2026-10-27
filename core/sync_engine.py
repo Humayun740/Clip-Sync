@@ -1,11 +1,17 @@
 import os
+import json
 import time
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Callable
+from datetime import datetime
 
 from core.config import AppConfig
 from core.scanner import scan_local_clips, ClipInfo
 from core.gdrive import GoogleDriveManager, DriveFile
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+STATUS_FILE = BASE_DIR / "status.json"
+LOG_FILE = BASE_DIR / "sync.log"
 
 class SyncEngine:
     def __init__(
@@ -22,7 +28,49 @@ class SyncEngine:
         self.is_running = False
 
     def log(self, msg: str):
-        self.log_callback(msg)
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        formatted = f"[{timestamp}] {msg}"
+        self.log_callback(formatted)
+        
+        # Append to persistent sync.log file
+        try:
+            with open(LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(formatted + "\n")
+        except Exception:
+            pass
+
+    def _write_status(
+        self,
+        status: str,
+        current_file: str = "",
+        percent: int = 0,
+        current_bytes: int = 0,
+        total_bytes: int = 0,
+        cloud_files_count: int = 0,
+        cloud_size_gb: float = 0.0,
+        last_message: str = ""
+    ):
+        """Writes live atomic status for GUI or other tools to inspect."""
+        data = {
+            "status": status,
+            "pid": os.getpid(),
+            "current_file": current_file,
+            "percent": percent,
+            "current_bytes": current_bytes,
+            "total_bytes": total_bytes,
+            "cloud_files_count": cloud_files_count,
+            "cloud_size_gb": round(cloud_size_gb, 2),
+            "cloud_limit_gb": self.config.storage_limit_gb,
+            "last_updated": time.time(),
+            "last_message": last_message
+        }
+        try:
+            temp_file = BASE_DIR / "status.tmp"
+            with open(temp_file, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            temp_file.replace(STATUS_FILE)
+        except Exception:
+            pass
 
     def run_sync_cycle(self) -> Dict[str, Any]:
         """
@@ -49,6 +97,8 @@ class SyncEngine:
 
         try:
             self.log("=== Starting Clip Sync Cycle ===")
+            self._write_status("authenticating", last_message="Checking Google Drive authentication...")
+
             if not self.drive.is_authenticated():
                 self.log("Google Drive is not authenticated. Attempting authentication...")
                 self.drive.authenticate(callback_prompt=self.log)
@@ -59,25 +109,32 @@ class SyncEngine:
             local_dir = self.config.local_clips_dir
 
             self.log(f"Target Cloud Folder: '{folder_name}' | Storage Limit: {limit_gb:.1f} GB")
+            self._write_status("scanning", last_message=f"Fetching files from Google Drive...")
 
             # 1. Fetch current cloud state
-            self.log(f"Fetching existing files from Google Drive folder '{folder_name}'...")
             cloud_files = self.drive.list_files_in_folder(folder_name)
             current_cloud_size = sum(f.size for f in cloud_files)
             cloud_file_names = {f.name for f in cloud_files}
 
+            cloud_size_gb = current_cloud_size / (1024 ** 3)
             self.log(
                 f"Cloud status: {len(cloud_files)} files | "
-                f"{current_cloud_size / (1024 ** 3):.2f} / {limit_gb:.1f} GB used"
+                f"{cloud_size_gb:.2f} / {limit_gb:.1f} GB used"
+            )
+            self._write_status(
+                "scanning",
+                cloud_files_count=len(cloud_files),
+                cloud_size_gb=cloud_size_gb,
+                last_message=f"Cloud status: {len(cloud_files)} files ({cloud_size_gb:.2f} GB)"
             )
 
             # 2. If existing cloud size exceeds limit (e.g. user lowered limit), evict oldest first
             while cloud_files and current_cloud_size > limit_bytes:
                 oldest = cloud_files.pop(0)
-                self.log(
-                    f"[Pruning Overlimit] Evicting oldest file '{oldest.name}' "
-                    f"({oldest.size_mb:.1f} MB) to satisfy new limit..."
-                )
+                msg = f"[Pruning Overlimit] Evicting oldest file '{oldest.name}' ({oldest.size_mb:.1f} MB)..."
+                self.log(msg)
+                self._write_status("evicting", current_file=oldest.name, last_message=msg)
+
                 if self.drive.delete_file(oldest.file_id):
                     current_cloud_size -= oldest.size
                     cloud_file_names.discard(oldest.name)
@@ -110,10 +167,13 @@ class SyncEngine:
                     # FIFO Eviction: While adding this clip would exceed limit, delete oldest cloud clip
                     while cloud_files and (current_cloud_size + clip_size > limit_bytes):
                         oldest = cloud_files.pop(0)
-                        self.log(
-                            f"[Auto-Evict] Space needed for '{clip.name}' ({clip.size_mb:.1f} MB). "
+                        evict_msg = (
+                            f"[Auto-Evict] Space needed for '{clip.name}'. "
                             f"Deleting oldest cloud clip '{oldest.name}' ({oldest.size_mb:.1f} MB)..."
                         )
+                        self.log(evict_msg)
+                        self._write_status("evicting", current_file=oldest.name, last_message=evict_msg)
+
                         if self.drive.delete_file(oldest.file_id):
                             current_cloud_size -= oldest.size
                             cloud_file_names.discard(oldest.name)
@@ -132,8 +192,19 @@ class SyncEngine:
                     self.log(f"[Uploading] '{clip.name}' ({clip.size_mb:.1f} MB)...")
                     try:
                         def upload_progress(current, total):
+                            percent = int((current / total) * 100) if total > 0 else 0
                             if self.progress_callback:
                                 self.progress_callback(clip.name, current, total)
+                            self._write_status(
+                                status="uploading",
+                                current_file=clip.name,
+                                percent=percent,
+                                current_bytes=current,
+                                total_bytes=total,
+                                cloud_files_count=len(cloud_files),
+                                cloud_size_gb=current_cloud_size / (1024 ** 3),
+                                last_message=f"Uploading {clip.name} ({percent}%)"
+                            )
 
                         uploaded_file = self.drive.upload_file(
                             clip.path,
@@ -146,12 +217,12 @@ class SyncEngine:
                         stats["uploaded"] += 1
                         stats["bytes_uploaded"] += uploaded_file.size
 
-                        self.log(
+                        succ_msg = (
                             f"[Success] Uploaded '{clip.name}'. "
-                            f"Current cloud usage: {current_cloud_size / (1024 ** 3):.2f} / {limit_gb:.1f} GB."
+                            f"Cloud usage: {current_cloud_size / (1024 ** 3):.2f} / {limit_gb:.1f} GB."
                         )
+                        self.log(succ_msg)
 
-                        # Optional: if user configured delete_local_after_upload
                         if self.config.delete_local_after_upload:
                             try:
                                 clip.path.unlink()
@@ -168,10 +239,18 @@ class SyncEngine:
             stats["cloud_size_gb"] = current_cloud_size / (1024 ** 3)
             self.log(f"=== Sync Completed. {stats['uploaded']} uploaded, {stats['evicted']} evicted. Cloud: {stats['cloud_size_gb']:.2f} GB ===")
 
+            self._write_status(
+                status="idle",
+                cloud_files_count=len(cloud_files),
+                cloud_size_gb=stats["cloud_size_gb"],
+                last_message="Sync completed successfully. Idle."
+            )
+
         except Exception as e:
             err = f"Sync cycle encountered an error: {e}"
             self.log(f"[Fatal] {err}")
             stats["errors"].append(err)
+            self._write_status("error", last_message=err)
         finally:
             self.is_running = False
 
