@@ -80,7 +80,7 @@ class PassthruMainWindow(QMainWindow):
 
     def init_ui(self):
         self.setWindowTitle("Passthru - Game Clip Auto-Sync & Rolling Cloud")
-        self.resize(780, 680)
+        self.resize(800, 700)
 
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
@@ -120,9 +120,9 @@ class PassthruMainWindow(QMainWindow):
         folder_layout.addWidget(btn_browse)
         config_layout.addLayout(folder_layout)
 
-        # Storage Limit & Cloud Folder
+        # Storage Limit, Retention Days & Cloud Folder
         settings_row = QHBoxLayout()
-        settings_row.addWidget(QLabel("Google Drive Folder:"))
+        settings_row.addWidget(QLabel("Drive Folder:"))
         self.txt_drive_folder = QLineEdit(self.config.drive_folder_name)
         settings_row.addWidget(self.txt_drive_folder)
 
@@ -131,8 +131,15 @@ class PassthruMainWindow(QMainWindow):
         self.spin_limit_gb.setRange(0.5, 2000.0)
         self.spin_limit_gb.setSingleStep(0.5)
         self.spin_limit_gb.setValue(self.config.storage_limit_gb)
-        self.spin_limit_gb.setToolTip("Oldest clips in Google Drive are automatically replaced when this limit is reached.")
+        self.spin_limit_gb.setToolTip("Oldest clips are replaced when this limit is reached.")
         settings_row.addWidget(self.spin_limit_gb)
+
+        settings_row.addWidget(QLabel("Retention (Days):"))
+        self.spin_retention = QSpinBox()
+        self.spin_retention.setRange(1, 3650)
+        self.spin_retention.setValue(self.config.retention_days)
+        self.spin_retention.setToolTip("Only sync clips created in the last N days (e.g. 14 for 2 weeks).")
+        settings_row.addWidget(self.spin_retention)
 
         settings_row.addWidget(QLabel("Check Every (Min):"))
         self.spin_interval = QSpinBox()
@@ -153,7 +160,9 @@ class PassthruMainWindow(QMainWindow):
         status_layout = QVBoxLayout(status_group)
 
         storage_row = QHBoxLayout()
-        self.lbl_storage_info = QLabel(f"Cloud Storage Limit: {self.config.storage_limit_gb:.1f} GB")
+        self.lbl_storage_info = QLabel(
+            f"Cloud Limit: {self.config.storage_limit_gb:.1f} GB | Retention: {self.config.retention_days} Days"
+        )
         storage_row.addWidget(self.lbl_storage_info)
         storage_row.addStretch()
         self.lbl_cloud_file_count = QLabel("Cloud Files: Unknown")
@@ -245,7 +254,6 @@ class PassthruMainWindow(QMainWindow):
             try:
                 with open(LOG_FILE, "r", encoding="utf-8", errors="ignore") as f:
                     lines = f.readlines()
-                    # Show last 100 lines
                     recent = lines[-100:]
                     self.log_box.setPlainText("".join(recent))
                     self.log_box.moveCursor(QTextCursor.End)
@@ -291,12 +299,10 @@ class PassthruMainWindow(QMainWindow):
                 self.bar_storage.setValue(percent)
                 self.bar_storage.setFormat(f"Cloud Used: {cloud_size_gb:.2f} / {limit_gb:.1f} GB ({percent}%)")
 
-            # If background process is uploading
+            # If background process is active
             if is_active and pid != os.getpid() and status in ("uploading", "scanning", "evicting", "authenticating"):
-                current_file = data.get("current_file", "")
-                upload_percent = data.get("percent", 0)
                 msg = data.get("last_message", "")
-
+                upload_percent = data.get("percent", 0)
                 self.btn_sync_now.setEnabled(False)
                 self.btn_sync_now.setText(f"Syncing in Background (PID {pid})...")
                 self.lbl_upload_status.setText(f"Status: {msg}")
@@ -359,14 +365,21 @@ class PassthruMainWindow(QMainWindow):
         self.config.local_clips_dir = self.txt_local_dir.text().strip()
         self.config.drive_folder_name = self.txt_drive_folder.text().strip()
         self.config.storage_limit_gb = float(self.spin_limit_gb.value())
+        self.config.retention_days = int(self.spin_retention.value())
         self.config.check_interval_seconds = int(self.spin_interval.value() * 60)
         self.config.save()
 
         self.engine.config = self.config
         self.watcher.interval_seconds = self.config.check_interval_seconds
-        self.lbl_storage_info.setText(f"Cloud Storage Limit: {self.config.storage_limit_gb:.1f} GB")
+        self.lbl_storage_info.setText(
+            f"Cloud Limit: {self.config.storage_limit_gb:.1f} GB | Retention: {self.config.retention_days} Days"
+        )
 
-        self.append_log(f"Settings saved: Storage Limit = {self.config.storage_limit_gb:.1f} GB, Interval = {self.config.check_interval_seconds // 60} mins.")
+        self.append_log(
+            f"Settings saved: Limit = {self.config.storage_limit_gb:.1f} GB, "
+            f"Retention = {self.config.retention_days} days, "
+            f"Interval = {self.config.check_interval_seconds // 60} mins."
+        )
         QMessageBox.information(self, "Settings Saved", "Configuration updated successfully!")
 
     def append_log(self, text: str):
