@@ -1,0 +1,24 @@
+# Google Drive OAuth Credentials & Tokens (NEVER commit these)
+credentials.json
+token.json
+client_secrets.json
+
+# Python bytecode & cache
+__pycache__/
+*.py[cod]
+*$py.class
+*/__pycache__/
+core/__pycache__/
+tests/__pycache__/
+ui/__pycache__/
+
+# Environment & IDE
+.env
+.venv/
+env/
+venv/
+.idea/
+.vscode/
+
+# Logs
+*.log

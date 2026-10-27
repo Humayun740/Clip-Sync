@@ -12,7 +12,7 @@
         "Exported Clips",
         "Shared Clips"
     ],
-    "check_interval_seconds": 300,
+    "check_interval_seconds": 3600,
     "auto_sync": true,
     "delete_local_after_upload": false
 }
