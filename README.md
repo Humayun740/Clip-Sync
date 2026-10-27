@@ -1,6 +1,6 @@
-# 🎮 Passthru - Game Clip Cloud Sync & Rolling Storage Manager
+# ClipSync - Game Clip Cloud Sync & Rolling Storage Manager
 
-**Passthru** is an automated desktop application and background utility that syncs your gaming clips (such as **SteelSeries GG Moments**) to Google Drive with an intelligent **rolling storage limit** (FIFO eviction), enabling seamless offline viewing on your Android phone.
+**ClipSync** is an automated desktop application and background utility that syncs your gaming clips (such as **SteelSeries GG Moments**) to Google Drive with an intelligent **rolling storage limit** (FIFO eviction), enabling seamless offline viewing on your Android phone.
 
 ---
 
@@ -19,7 +19,7 @@
 ## 📁 Directory Structure
 
 ```
-c:\Users\Humayun\Desktop\passthru\
+c:\Users\Humayun\Desktop\ClipSync\
 ├── config.json              # App settings (folder path, storage limit in GB, interval)
 ├── core/
 │   ├── config.py            # Configuration loader and validator
@@ -43,7 +43,7 @@ c:\Users\Humayun\Desktop\passthru\
 ## 🚀 Quick Start
 
 ### 1. One-Time Google Drive Credentials
-Follow the instructions in [`docs/GOOGLE_DRIVE_SETUP.md`](docs/GOOGLE_DRIVE_SETUP.md) to obtain your free `credentials.json` from Google Cloud Console and place it into the `passthru` directory.
+Follow the instructions in [`docs/GOOGLE_DRIVE_SETUP.md`](docs/GOOGLE_DRIVE_SETUP.md) to obtain your free `credentials.json` from Google Cloud Console and place it into the `ClipSync` directory.
 
 ### 2. Launching the App
 Double-click `run_gui.bat` or run:
